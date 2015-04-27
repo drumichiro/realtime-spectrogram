@@ -12,14 +12,12 @@ import struct
 
 
 class WaveOut:
-    # Records wave data from a microphone.
-    def __init__(self, name, samplingRate, length=None):
+    def __init__(self, name, samplingRate):
         # Setup parameters
         self.name = name
         self.samplingRate = samplingRate
         self.bits = 16
         self.channels = 1
-        self.length = length
         self.dones = 0
         self.SHORT_MAX = int(2**15)
 
@@ -30,12 +28,8 @@ class WaveOut:
         self.wavo.setframerate(self.samplingRate)
         self.wavo.setnframes(self.samplingRate*self.channels)
 
-    def isOpened(self):
-        return None == self.length or self.dones < self.length
-
     def __del__(self):
-        if self.isOpened():
-            self.wavo.close()
+        self.wavo.close()
 
     def write(self, signal):
         if not self.isOpened():
@@ -43,13 +37,7 @@ class WaveOut:
             return False
 
         # Written length of data.
-        samples = min([len(signal), self.length - self.dones])
-        shortSignal = signal[0:samples]*self.SHORT_MAX
+        shortSignal = signal*self.SHORT_MAX
         data = struct.pack("h"*len(shortSignal), *shortSignal)
         self.wavo.writeframes(data)
-
-        # If written data is full, the handle is closed.
-        self.dones += samples
-        if None != self.length and self.dones >= self.length:
-            self.wavo.close()
         return True
