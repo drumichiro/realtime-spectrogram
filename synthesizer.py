@@ -91,8 +91,14 @@ class Synthesizer:
         return np.random.random(self.getSineNum())*self.SAMPLING_RATE
 
     def generateSchroederPhase(self):
-        # TODO Implement!
-        return self.generateRandomPhase()
+        roughAmp = np.sum(self.amplitude, axis=0)
+        ampSquare = roughAmp*roughAmp
+        ampNorm = ampSquare/np.sum(ampSquare)
+        phase = np.zeros(self.getSineNum(), np.float)
+        coef = np.arange(self.getSineNum(), 0, -1)
+        for i1 in np.arange(1, self.getSineNum()):
+            phase[i1] = np.sum(coef[-i1:]*ampNorm[:i1])
+        return - phase*self.SAMPLING_RATE
 
     def generateZeroPhase(self):
         return np.zeros(self.getSineNum())
