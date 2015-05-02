@@ -11,30 +11,23 @@ import pylab as plt
 import threading
 import recorder as rec
 import synthesizer as syn
-import waveio as wav
-import time
-import matplotlib.animation as animation
 from matplotlib import gridspec
 from matplotlib.mlab import specgram
 from matplotlib.colors import LogNorm
+import matplotlib.animation as animation
+import time
 
 ###########################################
-SAMPLING_RATE = 44100
-FRAME_LENGTH = 1024
-BINS = FRAME_LENGTH/2 + 1
-BUFFER_LENGTH = FRAME_LENGTH*32*2
-SHOWED_SAMPLES = SAMPLING_RATE*3   # 3sec
-SHOWED_FRAMES = SHOWED_SAMPLES/FRAME_LENGTH
-PLOT_SIGNAL_FRAMES = SHOWED_FRAMES/2
-UPDATE_MSEC = 50
-SPECGRAM_WINDOW = np.hamming(FRAME_LENGTH)
+BUFFER_LENGTH = 64*1024
+BUFFER_MARGIN = 1024
 
 ###########################################
-FramePosition = 0   # Position of updated frame index.
-BufferPosition = 0
-SignalBufferFore = np.zeros(BUFFER_LENGTH)
-SignalBufferBack = np.zeros(BUFFER_LENGTH)
+PushedPosition = 0
+PopedPosition = 0
+SignalBuffer = np.zeros(BUFFER_LENGTH)
 BufferSemaphore = threading.Semaphore()
+BufferPushEvent = threading.Event()
+BufferPopEvent = threading.Event()
 
 ###########################################
 
@@ -42,77 +35,127 @@ BufferSemaphore = threading.Semaphore()
 class AudioListener(threading.Thread):
     def __init__(self):
         super(AudioListener, self).__init__()
+        self.SAMPLING_RATE = 44100
+        self.FRAME_LENGTH = 1024
         self.running = True
-        self.audio = rec.Recoder(SAMPLING_RATE, FRAME_LENGTH)
-        # syn.Synthesizer(SAMPLING_RATE, SAMPLING_RATE, FRAME_LENGTH)
-
-    # releaseSignalBuffer() is a brother.
-    def accumulateSignalBuffer(self):
-        global BufferPosition
-        global SignalBufferFore
-        stream = self.audio.getStream()
-        time.sleep(0.023)   # for synthesis
-        length = len(stream)
-        if 0 == length:
-            return False
-        BufferSemaphore.acquire()   # Lock.
-        end = BufferPosition + length
-        if end <= BUFFER_LENGTH:
-            SignalBufferFore[BufferPosition:end] = stream
-            BufferPosition = end
-        else:
-            print "Buffer is full."
-            time.sleep(2)
-        BufferSemaphore.release()   # Unlock.
-        return True
+        self.audio = rec.Recoder(self.SAMPLING_RATE, self.FRAME_LENGTH)
+        # self.audio = syn.Synthesizer(self.SAMPLING_RATE,
+        #                              np.ones((self.FRAME_LENGTH, 1)))
 
     def run(self):
         while self.running:
-            self.accumulateSignalBuffer()
+            signal = self.audio.getStream()
+            length = len(signal)
+            if 0 == length:
+                # Wait for Microphone to be ready
+                time.sleep(0.1)
+                continue
+            elif self.isNotSignalBufferReleased(length):
+                # Wait for accumulating.
+                BufferPopEvent.clear()
+                BufferPopEvent.wait()
+                # Retry to check.
+                continue
+
+            BufferSemaphore.acquire()   # Lock.
+            self.accumulateSignalBuffer(signal)
+            BufferSemaphore.release()   # Unlock.
+            if not BufferPushEvent.is_set():
+                # Suppose accumulating enough buffer in the above.
+                BufferPushEvent.set()
 
     def stop(self):
         self.running = False
+        self.join()
+        del self.audio
+
+    def isNotSignalBufferReleased(self, length):
+        rest = PopedPosition - PushedPosition
+        if rest <= 0:
+            rest += BUFFER_LENGTH
+        return length > (rest - BUFFER_MARGIN)
+
+    # releaseSignalBuffer() is a brother.
+    def accumulateSignalBuffer(self, signal):
+        global PushedPosition
+        global SignalBuffer
+        begin = PushedPosition
+        end = (PushedPosition + len(signal)) % BUFFER_LENGTH
+        assert BufferPopEvent.is_set()
+        PushedPosition = end
+        if begin < end:
+            SignalBuffer[begin:end] = signal
+        else:
+            rest = BUFFER_LENGTH - begin
+            SignalBuffer[begin:] = signal[:rest]
+            SignalBuffer[:end] = signal[rest:]
 
 
-# accumulateSignalBuffer() is a brother.
-def releaseSignalBuffer():
-    global BufferPosition
-    global SignalBufferFore
-    global SignalBufferBack
-    if 0 == BufferPosition:
-        return []
-    BufferSemaphore.acquire()   # Lock.
-    signal = SignalBufferFore[0:BufferPosition]
-    SignalBufferBack, SignalBufferFore = SignalBufferFore, SignalBufferBack
-    BufferPosition = 0
-    BufferSemaphore.release()   # Unlock.
-    return signal
+class SpecgramListener(threading.Thread):
+    def __init__(self, length, frames):
+        super(SpecgramListener, self).__init__()
+        self.FRAME_LENGTH = length
+        self.running = True
+        bins = self.FRAME_LENGTH/2 + 1
+        self.spectrogram = np.zeros((bins, frames), np.float)
+        self.window = np.hamming(self.FRAME_LENGTH)
+        self.frames = frames
+
+    def run(self):
+        pos = 0
+        while self.running:
+            if self.isNotSignalBufferAccumulated():
+                # Wait for accumulating.
+                BufferPushEvent.clear()
+                BufferPushEvent.wait()
+                # Retry to check.
+                continue
+
+            BufferSemaphore.acquire()   # Lock.
+            signal = self.releaseSignalBuffer()
+            self.spectrogram[:, pos:pos+1] = self.transformToSpecgram(signal)
+            BufferSemaphore.release()   # Unlock.
+            pos = (pos + 1) % self.frames
+            if not BufferPopEvent.is_set():
+                # Suppose releasing enough buffer in the above.
+                BufferPopEvent.set()
+
+    def stop(self):
+        self.running = False
+        self.join()
+
+    def isNotSignalBufferAccumulated(self):
+        rest = PushedPosition - PopedPosition
+        if rest < 0:
+            rest += BUFFER_LENGTH
+        return self.FRAME_LENGTH > (rest - BUFFER_MARGIN)
+
+    # accumulateSignalBuffer() is a brother.
+    def releaseSignalBuffer(self):
+        global PopedPosition
+        begin = PopedPosition
+        end = (PopedPosition + self.FRAME_LENGTH) % BUFFER_LENGTH
+        # PopedPosition is changed only here, so is_set() is always true.
+        assert BufferPushEvent.is_set()
+        PopedPosition = end
+        if begin < end:
+            return SignalBuffer[begin:end]
+        else:
+            return np.append(SignalBuffer[begin:], SignalBuffer[:end])
+
+    def transformToSpecgram(self, signal):
+        return specgram(signal, NFFT=self.FRAME_LENGTH,
+                        noverlap=0, window=self.window)[0].reshape((-1, 1))
+
+    def getSpecgramReference(self):
+        return self.spectrogram
 
 
-def updateSpectrogram(signal, spectrogram):
-    global FramePosition
-    if 0 == len(signal):
-        return False
-    spec = specgram(signal, NFFT=FRAME_LENGTH, noverlap=0,
-                    window=SPECGRAM_WINDOW)[0]
-    end = FramePosition + spec.shape[1]
-    if SHOWED_FRAMES < end:
-        FramePosition = 0
-        end = spec.shape[1]
-        assert end <= SHOWED_FRAMES
-    spectrogram[:, FramePosition:end] = spec
-    FramePosition = end
-    return True
-
-
-def updatePlot(axes, img):
+def updatePlot(i1, spectrogram, axes, img):
     img.set_data(spectrogram)
-
-
-def updateAnalysis(i1, spectrogram, axes, img):
-    signal = releaseSignalBuffer()
-    updateSpectrogram(signal, spectrogram)
-    updatePlot(axes, img)
+    # TODO Implement plotting envelopes.
+    line, = axl.plot([i1 % 20, 0, 0])
+    return [line, img]
 
 
 if __name__ == '__main__':
@@ -124,17 +167,21 @@ if __name__ == '__main__':
     axb = plt.subplot(gs[1, 1], sharex=axs)
     axes = [axs, axl, axb]
 
-    spectrogram = np.zeros((BINS, SHOWED_FRAMES), np.float)
-    # img = axs.imshow(spectrogram, vmin=0, vmax=1, aspect="auto")#animated
+    audio = AudioListener()
+    spec = SpecgramListener(1024, 150)
+    spectrogram = spec.getSpecgramReference()
     img = axs.matshow(spectrogram, aspect="auto", origin='lower',
                       norm=LogNorm(vmin=1e-10, vmax=1))
+    BufferPushEvent.set()
+    BufferPopEvent.set()
 
-    # Start plot and analysis
-    ani = animation.FuncAnimation(fig, updateAnalysis, interval=UPDATE_MSEC,
-                                  fargs=(spectrogram, axes, img))
-
-    # Start collecting audio data
-    trans = AudioListener()
-    trans.start()
-
+    # Start plot.
+    anime = animation.FuncAnimation(fig, updatePlot, interval=50, blit=True,
+                                    fargs=(spectrogram, axes, img))
+    audio.start()
+    spec.start()
+    print "Showing."
     plt.show()
+    audio.stop()
+    spec.stop()
+    print "Done."
